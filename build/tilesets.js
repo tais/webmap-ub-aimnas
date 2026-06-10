@@ -8,8 +8,20 @@ const fs = require('fs');
 const path = require('path');
 const { openSlf } = require('./slf');
 const { decodeSti } = require('./sti');
+const { parseJsd, buildZStripsForSti } = require('./structure');
 
 const GENERIC_TILESET = 0;
+
+// Parse a paired .jsd structure buffer into the per-subimage ZStripInfo array for an STI (the data that
+// drives the wall Z-occlusion in renderSector, mirroring the game's AddZStripInfoToVObject). Returns null
+// for a missing/empty buffer or an STI with no multi-tile wall structures.
+function zstripsFromBuf(jbuf, sti) {
+  if (!jbuf) return null;
+  let jsd;
+  try { jsd = parseJsd(jbuf); } catch (e) { jsd = null; }
+  if (!jsd) return null;
+  try { return buildZStripsForSti(jsd, sti.subimages); } catch (e) { return null; }
+}
 
 // Binary layout (source/TileEngine/WorldDat.cpp): u8 numSets, u32 numFileTypes, then per set:
 //   char[32] name (space-padded, NUL-terminated), u8 ambientId, numFileTypes * char[32] tile files.
@@ -99,20 +111,31 @@ function createTilesetResolver(ja2setSrcs, tilesetsDirs, baseSlfPaths) {
   const stats = { resolved: 0, fromLoose: 0, fromSlf: 0, generic: 0, missing: 0, missingFiles: new Set() };
 
   function decode(buf) { if (!buf) return null; try { return decodeSti(buf); } catch (e) { return null; } }
+  // Read the sibling .jsd next to a loose .sti path (loose files vary in case, so try both .jsd and .JSD).
+  function looseJsdBuf(fp) {
+    for (const ext of ['.jsd', '.JSD']) {
+      const jp = fp.replace(/\.sti$/i, ext);
+      try { if (fs.existsSync(jp)) return fs.readFileSync(jp); } catch (e) {}
+    }
+    return null;
+  }
   function loadLoose(id, fnameLower) {
     const m = loose.get(id); if (!m) return null;
     const fp = m.get(fnameLower); if (!fp) return null;
     const key = 'L:' + fp;
     if (stiCache.has(key)) return stiCache.get(key);
     let sti = null; try { sti = decode(fs.readFileSync(fp)); } catch (e) {}
+    if (sti) sti.zstrips = zstripsFromBuf(looseJsdBuf(fp), sti); // per-subimage wall Z-strips (or null)
     stiCache.set(key, sti); return sti;
   }
   function loadSlf(id, fname) {
     if (!baseSlfs.length) return null;
     const key = 'S:' + id + '\\' + fname;
     if (stiCache.has(key)) return stiCache.get(key);
-    let sti = null;
-    for (const slf of baseSlfs) { const buf = slf.get(id + '\\' + fname); if (buf) { sti = decode(buf); if (sti) break; } }
+    let sti = null, srcSlf = null;
+    for (const slf of baseSlfs) { const buf = slf.get(id + '\\' + fname); if (buf) { sti = decode(buf); if (sti) { srcSlf = slf; break; } } }
+    // Fetch the paired .JSD from the SAME slf the STI came from (`id\name` with .STI -> .JSD).
+    if (sti && srcSlf) sti.zstrips = zstripsFromBuf(srcSlf.get(id + '\\' + fname.replace(/\.sti$/i, '.JSD')), sti);
     stiCache.set(key, sti); return sti;
   }
 
